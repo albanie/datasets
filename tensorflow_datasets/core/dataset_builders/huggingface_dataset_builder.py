@@ -34,6 +34,7 @@ import multiprocessing
 import os
 from typing import Any, Dict, Optional, Union
 
+from absl import logging
 from etils import epath
 from tensorflow_datasets.core import dataset_builder
 from tensorflow_datasets.core import dataset_info as dataset_info_lib
@@ -94,6 +95,7 @@ def _write_shard(
     hf_builder,
     example_writer,
     features: feature_lib.FeaturesDict,
+    ignore_hf_errors: bool,
 ) -> int:
   """Writes shard to the file.
 
@@ -102,6 +104,8 @@ def _write_shard(
     hf_builder: HuggingFace dataset builder.
     example_writer: Example writer.
     features: TFDS features dict.
+    ignore_hf_errors: Whether to silence and log Hugging Face errors during
+      retrieval.
 
   Returns:
     Shard size in bytes.
@@ -109,12 +113,27 @@ def _write_shard(
   serialized_info = features.get_serialized_info()
   serializer = example_serializer.ExampleSerializer(serialized_info)
   num_bytes = 0
+  num_examples = 0
+  num_exceptions = 0
 
   def get_serialized_examples_iter():
     nonlocal num_bytes
-    for hf_value in hf_builder.as_dataset(
+    nonlocal num_examples
+    nonlocal num_exceptions
+    dataset = hf_builder.as_dataset(
         split=shard_spec.shard_split, run_post_process=False
-    ):
+    )
+    num_examples += len(dataset)
+    for i in range(len(dataset)):
+      try:
+        hf_value = dataset[i]
+      except Exception as exception:  # pylint: disable=broad-exception-caught
+        num_exceptions += 1
+        if ignore_hf_errors:
+          logging.exception('Ignoring Hugging Face error')
+          continue
+        else:
+          raise exception
       example = huggingface_utils.convert_hf_value(hf_value, features)
       encoded_example = features.encode_example(example)
       serialized_example = serializer.serialize_example(encoded_example)
@@ -132,6 +151,14 @@ def _write_shard(
           mininterval=1.0,
       ),
   )
+
+  if ignore_hf_errors and num_examples > 0:
+    percentage_exceptions = num_exceptions / num_examples * 100
+    logging.info(
+        'Got %d exceptions (%.2f%%) during Hugging Face generation',
+        num_exceptions,
+        percentage_exceptions,
+    )
 
   return num_bytes
 
@@ -160,6 +187,7 @@ class HuggingfaceDatasetBuilder(
       hf_hub_token: Optional[str] = None,
       hf_num_proc: Optional[int] = None,
       tfds_num_proc: Optional[int] = None,
+      ignore_hf_errors: bool | None = False,
       **config_kwargs,
   ):
     self._hf_repo_id = hf_repo_id
@@ -199,6 +227,7 @@ class HuggingfaceDatasetBuilder(
     if self._hf_config:
       self._builder_config = self._converted_builder_config
     self.generation_errors = []
+    self._ignore_hf_errors = ignore_hf_errors
 
   @property
   def builder_config(self) -> Optional[Any]:
@@ -340,6 +369,7 @@ class HuggingfaceDatasetBuilder(
         hf_builder=self._hf_builder,
         example_writer=self._example_writer(),
         features=self.info.features,
+        ignore_hf_errors=self._ignore_hf_errors,
     )
 
     if self._tfds_num_proc is None:
